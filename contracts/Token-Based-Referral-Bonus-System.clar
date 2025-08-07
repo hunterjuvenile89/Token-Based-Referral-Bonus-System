@@ -8,6 +8,21 @@
 (define-constant ERR-INVALID-AMOUNT (err u106))
 (define-constant ERR-REFERRAL-NOT-FOUND (err u107))
 
+(define-constant TIER-BRONZE u1)
+(define-constant TIER-SILVER u2)
+(define-constant TIER-GOLD u3)
+(define-constant TIER-PLATINUM u4)
+
+(define-constant MULTIPLIER-BRONZE u100)
+(define-constant MULTIPLIER-SILVER u125)
+(define-constant MULTIPLIER-GOLD u150)
+(define-constant MULTIPLIER-PLATINUM u200)
+
+(define-constant BRONZE-THRESHOLD u3)
+(define-constant SILVER-THRESHOLD u10)
+(define-constant GOLD-THRESHOLD u25)
+(define-constant PLATINUM-THRESHOLD u50)
+
 (define-constant REFERRAL-REWARD u1000000)
 (define-constant CONFIRMATION-BLOCKS u144)
 
@@ -184,4 +199,109 @@
 
 (define-read-only (get-confirmation-blocks)
   CONFIRMATION-BLOCKS
+)
+
+
+(define-map user-tiers principal uint)
+
+(define-private (calculate-user-tier (referral-count uint))
+  (if (>= referral-count PLATINUM-THRESHOLD)
+    TIER-PLATINUM
+    (if (>= referral-count GOLD-THRESHOLD)
+      TIER-GOLD
+      (if (>= referral-count SILVER-THRESHOLD)
+        TIER-SILVER
+        (if (>= referral-count BRONZE-THRESHOLD)
+          TIER-BRONZE
+          u0
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-tier-multiplier (tier uint))
+  (if (is-eq tier TIER-PLATINUM)
+    MULTIPLIER-PLATINUM
+    (if (is-eq tier TIER-GOLD)
+      MULTIPLIER-GOLD
+      (if (is-eq tier TIER-SILVER)
+        MULTIPLIER-SILVER
+        (if (is-eq tier TIER-BRONZE)
+          MULTIPLIER-BRONZE
+          u100
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-tiered-reward (base-reward uint) (user principal))
+  (let (
+    (user-data (unwrap! (map-get? users user) base-reward))
+    (referral-count (get referral-count user-data))
+    (user-tier (calculate-user-tier referral-count))
+    (multiplier (get-tier-multiplier user-tier))
+  )
+    (map-set user-tiers user user-tier)
+    (/ (* base-reward multiplier) u100)
+  )
+)
+
+(define-public (claim-tiered-reward (referral-id uint))
+  (let (
+    (referral (unwrap! (map-get? referrals referral-id) ERR-REFERRAL-NOT-FOUND))
+    (referrer (get referrer referral))
+    (tiered-reward (calculate-tiered-reward REFERRAL-REWARD referrer))
+  )
+    (asserts! (is-eq tx-sender referrer) ERR-UNAUTHORIZED)
+    (asserts! (get confirmed referral) ERR-INVALID-REFERRAL)
+    (asserts! (not (get reward-claimed referral)) ERR-ALREADY-CONFIRMED)
+    (asserts! (>= (var-get contract-balance) tiered-reward) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (stx-transfer? tiered-reward (as-contract tx-sender) referrer))
+    (var-set contract-balance (- (var-get contract-balance) tiered-reward))
+    
+    (map-set referrals referral-id (merge referral { reward-claimed: true }))
+    
+    (let (
+      (referrer-data (unwrap! (map-get? users referrer) ERR-NOT-REGISTERED))
+    )
+      (map-set users referrer (merge referrer-data {
+        total-rewards: (+ (get total-rewards referrer-data) tiered-reward)
+      }))
+    )
+    (ok tiered-reward)
+  )
+)
+
+(define-read-only (get-user-tier (user principal))
+  (default-to u0 (map-get? user-tiers user))
+)
+
+(define-read-only (get-tier-info (user principal))
+  (let (
+    (user-data (map-get? users user))
+  )
+    (match user-data
+      data
+        (let (
+          (referral-count (get referral-count data))
+          (current-tier (calculate-user-tier referral-count))
+          (multiplier (get-tier-multiplier current-tier))
+        )
+          (ok {
+            tier: current-tier,
+            multiplier: multiplier,
+            referrals: referral-count,
+            next-threshold: (if (< current-tier TIER-PLATINUM)
+              (if (< current-tier TIER-GOLD) 
+                (if (< current-tier TIER-SILVER) SILVER-THRESHOLD GOLD-THRESHOLD)
+                PLATINUM-THRESHOLD)
+              u0)
+          })
+        )
+      ERR-NOT-REGISTERED
+    )
+  )
 )
