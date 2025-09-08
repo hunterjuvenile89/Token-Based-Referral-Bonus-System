@@ -23,6 +23,19 @@
 (define-constant GOLD-THRESHOLD u25)
 (define-constant PLATINUM-THRESHOLD u50)
 
+(define-constant ACHIEVEMENT-ROOKIE u1)
+(define-constant ACHIEVEMENT-CHAMPION u2)
+(define-constant ACHIEVEMENT-LEGEND u3)
+(define-constant ACHIEVEMENT-IMMORTAL u4)
+
+(define-constant ROOKIE-MILESTONE u5)
+(define-constant CHAMPION-MILESTONE u20)
+(define-constant LEGEND-MILESTONE u50)
+(define-constant IMMORTAL-MILESTONE u100)
+
+(define-data-var leaderboard-epoch uint u0)
+(define-data-var epoch-start-block uint stacks-block-height)
+
 (define-constant REFERRAL-REWARD u1000000)
 (define-constant CONFIRMATION-BLOCKS u144)
 
@@ -304,4 +317,52 @@
       ERR-NOT-REGISTERED
     )
   )
+)
+
+
+(define-map epoch-rankings uint (list 10 { user: principal, score: uint }))
+(define-map user-achievements principal (list 4 uint))
+(define-map user-epoch-scores { user: principal, epoch: uint } uint)
+
+(define-private (update-user-score (user principal) (score-increase uint))
+  (let (
+    (current-epoch (var-get leaderboard-epoch))
+    (current-score (default-to u0 (map-get? user-epoch-scores { user: user, epoch: current-epoch })))
+    (new-score (+ current-score score-increase))
+  )
+    (map-set user-epoch-scores { user: user, epoch: current-epoch } new-score)
+
+    (ok new-score)
+  )
+)
+
+
+
+(define-public (start-new-epoch)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set leaderboard-epoch (+ (var-get leaderboard-epoch) u1))
+    (var-set epoch-start-block stacks-block-height)
+    (ok (var-get leaderboard-epoch))
+  )
+)
+
+(define-read-only (get-current-leaderboard)
+  (default-to (list) (map-get? epoch-rankings (var-get leaderboard-epoch)))
+)
+
+(define-read-only (get-user-achievements (user principal))
+  (default-to (list) (map-get? user-achievements user))
+)
+
+(define-read-only (get-user-epoch-score (user principal))
+  (default-to u0 (map-get? user-epoch-scores { user: user, epoch: (var-get leaderboard-epoch) }))
+)
+
+(define-read-only (get-leaderboard-info)
+  {
+    epoch: (var-get leaderboard-epoch),
+    epoch-start: (var-get epoch-start-block),
+    current-block: stacks-block-height
+  }
 )
