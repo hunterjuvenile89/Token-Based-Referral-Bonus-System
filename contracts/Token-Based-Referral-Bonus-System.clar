@@ -1,0 +1,368 @@
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant ERR-UNAUTHORIZED (err u100))
+(define-constant ERR-ALREADY-REGISTERED (err u101))
+(define-constant ERR-NOT-REGISTERED (err u102))
+(define-constant ERR-INVALID-REFERRAL (err u103))
+(define-constant ERR-ALREADY-CONFIRMED (err u104))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u105))
+(define-constant ERR-INVALID-AMOUNT (err u106))
+(define-constant ERR-REFERRAL-NOT-FOUND (err u107))
+
+(define-constant TIER-BRONZE u1)
+(define-constant TIER-SILVER u2)
+(define-constant TIER-GOLD u3)
+(define-constant TIER-PLATINUM u4)
+
+(define-constant MULTIPLIER-BRONZE u100)
+(define-constant MULTIPLIER-SILVER u125)
+(define-constant MULTIPLIER-GOLD u150)
+(define-constant MULTIPLIER-PLATINUM u200)
+
+(define-constant BRONZE-THRESHOLD u3)
+(define-constant SILVER-THRESHOLD u10)
+(define-constant GOLD-THRESHOLD u25)
+(define-constant PLATINUM-THRESHOLD u50)
+
+(define-constant ACHIEVEMENT-ROOKIE u1)
+(define-constant ACHIEVEMENT-CHAMPION u2)
+(define-constant ACHIEVEMENT-LEGEND u3)
+(define-constant ACHIEVEMENT-IMMORTAL u4)
+
+(define-constant ROOKIE-MILESTONE u5)
+(define-constant CHAMPION-MILESTONE u20)
+(define-constant LEGEND-MILESTONE u50)
+(define-constant IMMORTAL-MILESTONE u100)
+
+(define-data-var leaderboard-epoch uint u0)
+(define-data-var epoch-start-block uint stacks-block-height)
+
+(define-constant REFERRAL-REWARD u1000000)
+(define-constant CONFIRMATION-BLOCKS u144)
+
+(define-data-var contract-balance uint u0)
+(define-data-var next-referral-id uint u1)
+
+(define-map users 
+  principal 
+  {
+    registered: bool,
+    referrer: (optional principal),
+    total-rewards: uint,
+    referral-count: uint
+  }
+)
+
+(define-map referrals
+  uint
+  {
+    referrer: principal,
+    referred: principal,
+    created-at: uint,
+    confirmed: bool,
+    reward-claimed: bool
+  }
+)
+
+(define-map user-referrals principal (list 100 uint))
+
+(define-public (register (referrer (optional principal)))
+  (let (
+    (sender tx-sender)
+    (existing-user (map-get? users sender))
+  )
+    (asserts! (is-none existing-user) ERR-ALREADY-REGISTERED)
+    (match referrer
+      ref-principal 
+        (begin
+          (asserts! (is-some (map-get? users ref-principal)) ERR-NOT-REGISTERED)
+          (asserts! (not (is-eq ref-principal sender)) ERR-INVALID-REFERRAL)
+          (map-set users sender {
+            registered: true,
+            referrer: (some ref-principal),
+            total-rewards: u0,
+            referral-count: u0
+          })
+          (try! (create-referral ref-principal sender))
+          (ok true)
+        )
+      (begin
+        (map-set users sender {
+          registered: true,
+          referrer: none,
+          total-rewards: u0,
+          referral-count: u0
+        })
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (create-referral (referrer principal) (referred principal))
+  (let (
+    (referral-id (var-get next-referral-id))
+    (current-block stacks-block-height)
+  )
+    (map-set referrals referral-id {
+      referrer: referrer,
+      referred: referred,
+      created-at: current-block,
+      confirmed: false,
+      reward-claimed: false
+    })
+    (var-set next-referral-id (+ referral-id u1))
+    (let (
+      (current-referrals (default-to (list) (map-get? user-referrals referrer)))
+    )
+      (map-set user-referrals referrer (unwrap! (as-max-len? (append current-referrals referral-id) u100) ERR-INVALID-REFERRAL))
+    )
+    (ok referral-id)
+  )
+)
+
+(define-public (confirm-referral (referral-id uint))
+  (let (
+    (referral (unwrap! (map-get? referrals referral-id) ERR-REFERRAL-NOT-FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (not (get confirmed referral)) ERR-ALREADY-CONFIRMED)
+    (asserts! (>= current-block (+ (get created-at referral) CONFIRMATION-BLOCKS)) ERR-INVALID-REFERRAL)
+    
+    (map-set referrals referral-id (merge referral { confirmed: true }))
+    
+    (let (
+      (referrer (get referrer referral))
+      (referrer-data (unwrap! (map-get? users referrer) ERR-NOT-REGISTERED))
+    )
+      (map-set users referrer (merge referrer-data {
+        referral-count: (+ (get referral-count referrer-data) u1)
+      }))
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-reward (referral-id uint))
+  (let (
+    (referral (unwrap! (map-get? referrals referral-id) ERR-REFERRAL-NOT-FOUND))
+    (referrer (get referrer referral))
+  )
+    (asserts! (is-eq tx-sender referrer) ERR-UNAUTHORIZED)
+    (asserts! (get confirmed referral) ERR-INVALID-REFERRAL)
+    (asserts! (not (get reward-claimed referral)) ERR-ALREADY-CONFIRMED)
+    (asserts! (>= (var-get contract-balance) REFERRAL-REWARD) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (stx-transfer? REFERRAL-REWARD (as-contract tx-sender) referrer))
+    (var-set contract-balance (- (var-get contract-balance) REFERRAL-REWARD))
+    
+    (map-set referrals referral-id (merge referral { reward-claimed: true }))
+    
+    (let (
+      (referrer-data (unwrap! (map-get? users referrer) ERR-NOT-REGISTERED))
+    )
+      (map-set users referrer (merge referrer-data {
+        total-rewards: (+ (get total-rewards referrer-data) REFERRAL-REWARD)
+      }))
+    )
+    (ok true)
+  )
+)
+
+(define-public (fund-contract)
+  (let (
+    (amount (stx-get-balance tx-sender))
+  )
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (var-set contract-balance (+ (var-get contract-balance) amount))
+    (ok amount)
+  )
+)
+
+(define-public (withdraw-funds (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (>= (var-get contract-balance) amount) ERR-INSUFFICIENT-BALANCE)
+    (try! (stx-transfer? amount (as-contract tx-sender) CONTRACT-OWNER))
+    (var-set contract-balance (- (var-get contract-balance) amount))
+    (ok true)
+  )
+)
+
+(define-read-only (get-user-info (user principal))
+  (map-get? users user)
+)
+
+(define-read-only (get-referral-info (referral-id uint))
+  (map-get? referrals referral-id)
+)
+
+(define-read-only (get-user-referrals (user principal))
+  (map-get? user-referrals user)
+)
+
+(define-read-only (get-contract-balance)
+  (var-get contract-balance)
+)
+
+(define-read-only (get-reward-amount)
+  REFERRAL-REWARD
+)
+
+(define-read-only (get-confirmation-blocks)
+  CONFIRMATION-BLOCKS
+)
+
+
+(define-map user-tiers principal uint)
+
+(define-private (calculate-user-tier (referral-count uint))
+  (if (>= referral-count PLATINUM-THRESHOLD)
+    TIER-PLATINUM
+    (if (>= referral-count GOLD-THRESHOLD)
+      TIER-GOLD
+      (if (>= referral-count SILVER-THRESHOLD)
+        TIER-SILVER
+        (if (>= referral-count BRONZE-THRESHOLD)
+          TIER-BRONZE
+          u0
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-tier-multiplier (tier uint))
+  (if (is-eq tier TIER-PLATINUM)
+    MULTIPLIER-PLATINUM
+    (if (is-eq tier TIER-GOLD)
+      MULTIPLIER-GOLD
+      (if (is-eq tier TIER-SILVER)
+        MULTIPLIER-SILVER
+        (if (is-eq tier TIER-BRONZE)
+          MULTIPLIER-BRONZE
+          u100
+        )
+      )
+    )
+  )
+)
+
+(define-private (calculate-tiered-reward (base-reward uint) (user principal))
+  (let (
+    (user-data (unwrap! (map-get? users user) base-reward))
+    (referral-count (get referral-count user-data))
+    (user-tier (calculate-user-tier referral-count))
+    (multiplier (get-tier-multiplier user-tier))
+  )
+    (map-set user-tiers user user-tier)
+    (/ (* base-reward multiplier) u100)
+  )
+)
+
+(define-public (claim-tiered-reward (referral-id uint))
+  (let (
+    (referral (unwrap! (map-get? referrals referral-id) ERR-REFERRAL-NOT-FOUND))
+    (referrer (get referrer referral))
+    (tiered-reward (calculate-tiered-reward REFERRAL-REWARD referrer))
+  )
+    (asserts! (is-eq tx-sender referrer) ERR-UNAUTHORIZED)
+    (asserts! (get confirmed referral) ERR-INVALID-REFERRAL)
+    (asserts! (not (get reward-claimed referral)) ERR-ALREADY-CONFIRMED)
+    (asserts! (>= (var-get contract-balance) tiered-reward) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (stx-transfer? tiered-reward (as-contract tx-sender) referrer))
+    (var-set contract-balance (- (var-get contract-balance) tiered-reward))
+    
+    (map-set referrals referral-id (merge referral { reward-claimed: true }))
+    
+    (let (
+      (referrer-data (unwrap! (map-get? users referrer) ERR-NOT-REGISTERED))
+    )
+      (map-set users referrer (merge referrer-data {
+        total-rewards: (+ (get total-rewards referrer-data) tiered-reward)
+      }))
+    )
+    (ok tiered-reward)
+  )
+)
+
+(define-read-only (get-user-tier (user principal))
+  (default-to u0 (map-get? user-tiers user))
+)
+
+(define-read-only (get-tier-info (user principal))
+  (let (
+    (user-data (map-get? users user))
+  )
+    (match user-data
+      data
+        (let (
+          (referral-count (get referral-count data))
+          (current-tier (calculate-user-tier referral-count))
+          (multiplier (get-tier-multiplier current-tier))
+        )
+          (ok {
+            tier: current-tier,
+            multiplier: multiplier,
+            referrals: referral-count,
+            next-threshold: (if (< current-tier TIER-PLATINUM)
+              (if (< current-tier TIER-GOLD) 
+                (if (< current-tier TIER-SILVER) SILVER-THRESHOLD GOLD-THRESHOLD)
+                PLATINUM-THRESHOLD)
+              u0)
+          })
+        )
+      ERR-NOT-REGISTERED
+    )
+  )
+)
+
+
+(define-map epoch-rankings uint (list 10 { user: principal, score: uint }))
+(define-map user-achievements principal (list 4 uint))
+(define-map user-epoch-scores { user: principal, epoch: uint } uint)
+
+(define-private (update-user-score (user principal) (score-increase uint))
+  (let (
+    (current-epoch (var-get leaderboard-epoch))
+    (current-score (default-to u0 (map-get? user-epoch-scores { user: user, epoch: current-epoch })))
+    (new-score (+ current-score score-increase))
+  )
+    (map-set user-epoch-scores { user: user, epoch: current-epoch } new-score)
+
+    (ok new-score)
+  )
+)
+
+
+
+(define-public (start-new-epoch)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set leaderboard-epoch (+ (var-get leaderboard-epoch) u1))
+    (var-set epoch-start-block stacks-block-height)
+    (ok (var-get leaderboard-epoch))
+  )
+)
+
+(define-read-only (get-current-leaderboard)
+  (default-to (list) (map-get? epoch-rankings (var-get leaderboard-epoch)))
+)
+
+(define-read-only (get-user-achievements (user principal))
+  (default-to (list) (map-get? user-achievements user))
+)
+
+(define-read-only (get-user-epoch-score (user principal))
+  (default-to u0 (map-get? user-epoch-scores { user: user, epoch: (var-get leaderboard-epoch) }))
+)
+
+(define-read-only (get-leaderboard-info)
+  {
+    epoch: (var-get leaderboard-epoch),
+    epoch-start: (var-get epoch-start-block),
+    current-block: stacks-block-height
+  }
+)
