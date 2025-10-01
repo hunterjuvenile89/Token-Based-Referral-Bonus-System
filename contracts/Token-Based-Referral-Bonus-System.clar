@@ -33,6 +33,10 @@
 (define-constant LEGEND-MILESTONE u50)
 (define-constant IMMORTAL-MILESTONE u100)
 
+(define-constant ERR-NO-ANCESTRY (err u108))
+(define-constant ERR-SECONDARY-CLAIMED (err u109))
+(define-constant SECONDARY-REWARD-PERCENT u25)
+
 (define-data-var leaderboard-epoch uint u0)
 (define-data-var epoch-start-block uint stacks-block-height)
 
@@ -365,4 +369,94 @@
     epoch-start: (var-get epoch-start-block),
     current-block: stacks-block-height
   }
+)
+
+
+(define-map referral-ancestry principal principal)
+(define-map secondary-rewards uint bool)
+
+(define-private (track-referral-ancestry (new-user principal) (parent principal))
+  (let (
+    (grandparent-opt (map-get? referral-ancestry parent))
+  )
+    (map-set referral-ancestry new-user parent)
+    (match grandparent-opt
+      grandparent (ok (some grandparent))
+      (ok none)
+    )
+  )
+)
+
+(define-public (claim-secondary-reward (referral-id uint))
+  (let (
+    (referral (unwrap! (map-get? referrals referral-id) ERR-REFERRAL-NOT-FOUND))
+    (direct-referrer (get referrer referral))
+    (grandparent-opt (map-get? referral-ancestry direct-referrer))
+    (grandparent (unwrap! grandparent-opt ERR-NO-ANCESTRY))
+    (secondary-amount (/ (* REFERRAL-REWARD SECONDARY-REWARD-PERCENT) u100))
+    (already-claimed (default-to false (map-get? secondary-rewards referral-id)))
+  )
+    (asserts! (is-eq tx-sender grandparent) ERR-UNAUTHORIZED)
+    (asserts! (get confirmed referral) ERR-INVALID-REFERRAL)
+    (asserts! (not already-claimed) ERR-SECONDARY-CLAIMED)
+    (asserts! (>= (var-get contract-balance) secondary-amount) ERR-INSUFFICIENT-BALANCE)
+    
+    (try! (stx-transfer? secondary-amount (as-contract tx-sender) grandparent))
+    (var-set contract-balance (- (var-get contract-balance) secondary-amount))
+    (map-set secondary-rewards referral-id true)
+    
+    (let (
+      (grandparent-data (unwrap! (map-get? users grandparent) ERR-NOT-REGISTERED))
+    )
+      (map-set users grandparent (merge grandparent-data {
+        total-rewards: (+ (get total-rewards grandparent-data) secondary-amount)
+      }))
+    )
+    (ok secondary-amount)
+  )
+)
+
+(define-public (register-with-ancestry (referrer (optional principal)))
+  (let (
+    (sender tx-sender)
+    (existing-user (map-get? users sender))
+  )
+    (asserts! (is-none existing-user) ERR-ALREADY-REGISTERED)
+    (match referrer
+      ref-principal 
+        (begin
+          (asserts! (is-some (map-get? users ref-principal)) ERR-NOT-REGISTERED)
+          (asserts! (not (is-eq ref-principal sender)) ERR-INVALID-REFERRAL)
+          (map-set users sender {
+            registered: true,
+            referrer: (some ref-principal),
+            total-rewards: u0,
+            referral-count: u0
+          })
+          (unwrap! (track-referral-ancestry sender ref-principal) ERR-INVALID-REFERRAL)
+          (try! (create-referral ref-principal sender))
+          (ok true)
+        )
+      (begin
+        (map-set users sender {
+          registered: true,
+          referrer: none,
+          total-rewards: u0,
+          referral-count: u0
+        })
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-read-only (get-referral-grandparent (user principal))
+  (match (map-get? referral-ancestry user)
+    parent (map-get? referral-ancestry parent)
+    none
+  )
+)
+
+(define-read-only (get-secondary-reward-status (referral-id uint))
+  (default-to false (map-get? secondary-rewards referral-id))
 )
