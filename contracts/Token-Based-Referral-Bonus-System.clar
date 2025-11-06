@@ -37,6 +37,13 @@
 (define-constant ERR-SECONDARY-CLAIMED (err u109))
 (define-constant SECONDARY-REWARD-PERCENT u25)
 
+(define-constant ERR-CAMPAIGN-EXPIRED (err u110))
+(define-constant ERR-INVALID-EXPIRY (err u111))
+(define-constant ERR-CAMPAIGN-NOT-FOUND (err u112))
+(define-constant MAX-CAMPAIGN-DURATION u1008)
+
+(define-data-var next-campaign-id uint u1)
+
 (define-data-var leaderboard-epoch uint u0)
 (define-data-var epoch-start-block uint stacks-block-height)
 
@@ -459,4 +466,90 @@
 
 (define-read-only (get-secondary-reward-status (referral-id uint))
   (default-to false (map-get? secondary-rewards referral-id))
+)
+
+(define-map referral-campaigns
+  uint
+  {
+    creator: principal,
+    expiry-block: uint,
+    reward-boost: uint,
+    total-signups: uint,
+    active: bool
+  }
+)
+
+(define-map user-campaigns principal (list 50 uint))
+
+(define-public (create-campaign (duration-blocks uint) (reward-boost uint))
+  (let (
+    (campaign-id (var-get next-campaign-id))
+    (expiry-block (+ stacks-block-height duration-blocks))
+    (sender tx-sender)
+    (user-data (map-get? users sender))
+  )
+    (asserts! (is-some user-data) ERR-NOT-REGISTERED)
+    (asserts! (and (> duration-blocks u0) (<= duration-blocks MAX-CAMPAIGN-DURATION)) ERR-INVALID-EXPIRY)
+    (asserts! (and (>= reward-boost u100) (<= reward-boost u300)) ERR-INVALID-AMOUNT)
+    
+    (map-set referral-campaigns campaign-id {
+      creator: sender,
+      expiry-block: expiry-block,
+      reward-boost: reward-boost,
+      total-signups: u0,
+      active: true
+    })
+    
+    (let (
+      (current-campaigns (default-to (list) (map-get? user-campaigns sender)))
+    )
+      (map-set user-campaigns sender 
+        (unwrap! (as-max-len? (append current-campaigns campaign-id) u50) ERR-INVALID-REFERRAL))
+    )
+    
+    (var-set next-campaign-id (+ campaign-id u1))
+    (ok campaign-id)
+  )
+)
+
+(define-public (register-via-campaign (campaign-id uint))
+  (let (
+    (campaign (unwrap! (map-get? referral-campaigns campaign-id) ERR-CAMPAIGN-NOT-FOUND))
+    (sender tx-sender)
+    (existing-user (map-get? users sender))
+    (creator (get creator campaign))
+  )
+    (asserts! (is-none existing-user) ERR-ALREADY-REGISTERED)
+    (asserts! (get active campaign) ERR-INVALID-REFERRAL)
+    (asserts! (< stacks-block-height (get expiry-block campaign)) ERR-CAMPAIGN-EXPIRED)
+    (asserts! (not (is-eq creator sender)) ERR-INVALID-REFERRAL)
+    
+    (map-set users sender {
+      registered: true,
+      referrer: (some creator),
+      total-rewards: u0,
+      referral-count: u0
+    })
+    
+    (map-set referral-campaigns campaign-id 
+      (merge campaign { total-signups: (+ (get total-signups campaign) u1) }))
+    
+    (try! (create-referral creator sender))
+    (ok true)
+  )
+)
+
+(define-read-only (get-campaign-info (campaign-id uint))
+  (map-get? referral-campaigns campaign-id)
+)
+
+(define-read-only (is-campaign-active (campaign-id uint))
+  (match (map-get? referral-campaigns campaign-id)
+    campaign (ok (and (get active campaign) (< stacks-block-height (get expiry-block campaign))))
+    ERR-CAMPAIGN-NOT-FOUND
+  )
+)
+
+(define-read-only (get-user-campaigns (user principal))
+  (map-get? user-campaigns user)
 )
